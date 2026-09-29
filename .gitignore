@@ -1,0 +1,32 @@
+# Dependencias (se reinstalan con npm install / composer install)
+node_modules/
+vendor/
+
+# Variables de entorno y credenciales — NUNCA subir
+.env
+.env.local
+.env.*.local
+
+# Archivos compilados / generados
+dist/
+build/
+
+# Logs
+*.log
+logs/
+
+# Archivos del sistema operativo
+.DS_Store
+Thumbs.db
+
+# Configuración de editores
+.vscode/
+.idea/
+
+# Python (si usas Python en alguna parte)
+__pycache__/
+venv/
+
+# Subidas de usuarios / archivos temporales
+uploads/
+tmp/

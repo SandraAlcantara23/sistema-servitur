@@ -1,0 +1,108 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Paleta clara (predeterminada) — colores oficiales Servitur Gran Clas.
+   Cada valor son los 3 canales RGB separados por espacio (sin rgb(...)),
+   como lo pide el formato de tailwind.config.js. */
+:root {
+  --color-rojo: 201 37 45;           /* #C9252D */
+  --color-rojo-hover: 169 31 39;     /* #A91F27 */
+  --color-azul: 23 63 99;            /* #173F63 */
+  --color-azul-oscuro: 18 52 81;     /* #123451 */
+  --color-fondo: 244 245 246;        /* #F4F5F6 */
+  --color-tarjeta: 255 255 255;      /* #FFFFFF */
+  --color-texto: 37 37 37;           /* #252525 */
+  --color-texto-secundario: 107 114 128; /* #6B7280 */
+}
+
+/* Paleta oscura — mismos acentos de marca (rojo/azul), pero un poco más
+   claros para que contrasten sobre fondos oscuros; azul-oscuro (usado en
+   Sidebar y el banner de bienvenida) se deja igual a propósito para que
+   esos elementos no cambien de color entre temas. */
+.dark {
+  --color-rojo: 224 74 82;           /* #E04A52 */
+  --color-rojo-hover: 196 55 63;     /* #C4373F */
+  --color-azul: 74 130 184;          /* #4A82B8 */
+  --color-fondo: 17 24 34;           /* #111822 */
+  --color-tarjeta: 26 35 48;         /* #1A2330 */
+  --color-texto: 229 231 235;        /* #E5E7EB */
+  --color-texto-secundario: 148 157 172; /* #949DAC */
+}
+
+body {
+  @apply bg-servitur-fondo text-servitur-texto font-sans antialiased;
+}
+
+/* Los <input>/<select>/<textarea> que no traen su propio color de fondo
+   (la mayoría solo trae borde) usan por defecto el blanco del navegador,
+   lo cual se ve mal sobre el tema oscuro. Aquí les damos el color de
+   "tarjeta" y "texto" del tema como base — cualquier clase de Tailwind que
+   un formulario ya traiga (bg-white, etc.) sigue ganando porque las
+   utilidades se inyectan después de esta capa "base". */
+@layer base {
+  input:not([type='checkbox']):not([type='radio']),
+  select,
+  textarea {
+    background-color: rgb(var(--color-tarjeta));
+    color: rgb(var(--color-texto));
+  }
+  input::placeholder,
+  textarea::placeholder {
+    color: rgb(var(--color-texto-secundario));
+  }
+}
+
+/* Le indica al navegador qué paleta usar para sus propios controles nativos
+   (icono del selector de fecha, flechas de <select>, scrollbar, etc.), para
+   que combinen con el tema sin tener que dibujarlos a mano. */
+:root {
+  color-scheme: light;
+}
+.dark {
+  color-scheme: dark;
+}
+
+/* Todas las tarjetas del sistema ganan una sombra más notoria y suave al pasar
+   el cursor encima, para que la interfaz se sienta más viva */
+.bg-servitur-tarjeta {
+  transition: box-shadow 0.2s ease, transform 0.15s ease, background-color 0.2s ease;
+}
+.bg-servitur-tarjeta:hover {
+  box-shadow: 0 8px 24px -6px rgba(23, 63, 99, 0.18);
+}
+.dark .bg-servitur-tarjeta:hover {
+  box-shadow: 0 8px 24px -6px rgba(0, 0, 0, 0.45);
+}
+
+/* Botones: leve efecto de "presionado" al hacer clic, para que se sientan táctiles */
+button {
+  transition: transform 0.1s ease, box-shadow 0.15s ease, opacity 0.15s ease, background-color 0.15s ease;
+}
+button:active {
+  transform: scale(0.97);
+}
+
+/* El área de reporte vive fuera de pantalla en la vista normal... */
+.print-area {
+  position: fixed;
+  left: -9999px;
+  top: 0;
+}
+
+/* ...y al imprimir, se oculta todo lo demás y solo se muestra el reporte */
+@media print {
+  body * {
+    visibility: hidden;
+  }
+  .print-area,
+  .print-area * {
+    visibility: visible;
+  }
+  .print-area {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+  }
+}
