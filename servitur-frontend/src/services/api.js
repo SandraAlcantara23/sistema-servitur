@@ -41,6 +41,9 @@ export async function login(username, password) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ username, password }),
   })
+  if (res.status === 429) {
+    throw new Error('Demasiados intentos. Espera un minuto e inténtalo de nuevo.')
+  }
   if (!res.ok) {
     throw new Error('Usuario o contraseña incorrectos.')
   }
@@ -57,7 +60,22 @@ export function logout() {
   limpiarTokens()
 }
 
-async function refrescarToken() {
+// Si varias peticiones expiran a la vez (p. ej. el Dashboard lanza 5 en
+// paralelo), todas comparten UNA sola renovación. Es necesario porque el
+// backend invalida el refresh token anterior en cada renovación: si cada
+// petición intentara renovar por su cuenta, solo la primera tendría éxito.
+let renovacionEnCurso = null
+
+function refrescarToken() {
+  if (!renovacionEnCurso) {
+    renovacionEnCurso = renovar().finally(() => {
+      renovacionEnCurso = null
+    })
+  }
+  return renovacionEnCurso
+}
+
+async function renovar() {
   const refresh = getRefreshToken()
   if (!refresh) return false
   try {
@@ -119,7 +137,13 @@ export async function apiFetch(path, { method = 'GET', body, headers = {} } = {}
     let detalle = ''
     try {
       const datosError = await res.json()
-      detalle = typeof datosError === 'string' ? datosError : JSON.stringify(datosError)
+      // Los mensajes del servidor vienen como {"detail": "..."}; se muestra solo el texto.
+      detalle =
+        typeof datosError === 'string'
+          ? datosError
+          : typeof datosError?.detail === 'string'
+            ? datosError.detail
+            : JSON.stringify(datosError)
     } catch {
       detalle = res.statusText
     }

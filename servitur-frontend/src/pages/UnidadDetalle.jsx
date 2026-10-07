@@ -5,6 +5,7 @@ import AppLayout from '../components/layout/AppLayout.jsx'
 import { exportarComoPDF } from '../utils/exportReports.js'
 import UnidadReportePrintable from '../components/reports/UnidadReportePrintable.jsx'
 import BloqueFotos from '../components/unidades/BloqueFotos.jsx'
+import HistorialMantenimiento from '../components/unidades/HistorialMantenimiento.jsx'
 import Toast from '../components/common/Toast.jsx'
 import { useToast } from '../hooks/useToast.js'
 import { useBitacora } from '../hooks/useBitacora.js'
@@ -45,7 +46,6 @@ export default function UnidadDetalle() {
   const [errorCarga, setErrorCarga] = useState('')
   const [editando, setEditando] = useState(false)
   const [form, setForm] = useState({})
-  const [debug, setDebug] = useState(null)
 
   const [fotosAsignacion, setFotosAsignacion] = useState([])
   const [fechaAsignacion, setFechaAsignacion] = useState('')
@@ -65,11 +65,6 @@ export default function UnidadDetalle() {
         if (!activo) return
         const ecoBuscado = String(eco ?? '').trim()
         const encontrada = data.find((u) => String(u.eco ?? '').trim() === ecoBuscado)
-        setDebug({
-          ecoDeLaUrl: JSON.stringify(eco),
-          totalUnidades: Array.isArray(data) ? data.length : 'NO ES ARREGLO: ' + JSON.stringify(data).slice(0, 200),
-          primerosEco: Array.isArray(data) ? data.slice(0, 5).map((u) => JSON.stringify(u.eco)) : [],
-        })
         setUnidad(encontrada ? normalizar(encontrada) : null)
       } catch (err) {
         if (activo) setErrorCarga(err.message || 'No se pudo cargar la unidad.')
@@ -96,11 +91,6 @@ export default function UnidadDetalle() {
         <Link to="/unidades" className="text-servitur-azul text-sm hover:underline">
           Volver a Unidades
         </Link>
-        {debug && (
-          <pre className="mt-4 text-xs bg-black text-green-400 p-3 rounded-lg overflow-auto whitespace-pre-wrap">
-            {JSON.stringify(debug, null, 2)}
-          </pre>
-        )}
       </AppLayout>
     )
   }
@@ -331,6 +321,9 @@ export default function UnidadDetalle() {
             </BloqueFotos>
           </div>
         </div>
+
+        {/* Historial de mantenimiento preventivo/correctivo */}
+        <HistorialMantenimiento unidad={unidad} mostrarToast={mostrarToast} registrar={registrar} />
       </div>
 
       {/* Área imprimible — invisible en pantalla, solo aparece al generar el PDF */}

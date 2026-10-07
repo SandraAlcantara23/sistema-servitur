@@ -1,16 +1,25 @@
 """
 core/views.py
 """
-import random
+import secrets
 import string
+from datetime import timedelta
 
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.utils import timezone
 from django.utils.text import slugify
 from rest_framework import viewsets, permissions
 from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
+from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
+from rest_framework_simplejwt.settings import api_settings as jwt_settings
 from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken, OutstandingToken
-from rest_framework_simplejwt.views import TokenObtainPairView
+from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.utils import datetime_from_epoch
+from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
 from .models import (
     Rol,
@@ -53,6 +62,9 @@ from .permissions import (
     EsPersonalOperativo,
     EsRH,
     EsConductor,
+    EsConductorSoloLectura,
+    nombre_rol,
+    puede_restablecer_password,
 )
 
 
@@ -88,16 +100,97 @@ def _describir_dispositivo(user_agent):
 
 
 def registrar_bitacora(usuario, accion, modulo, entidad_afectada):
+    """
+    Crea un evento en la bitácora de auditoría (siempre del lado del servidor).
+    Se recortan los textos al largo de cada columna para que un detalle largo
+    nunca tumbe la operación principal con un error de base de datos.
+    """
     BitacoraAuditoria.objects.create(
-        usuario=usuario, accion=accion, modulo=modulo, entidad_afectada=entidad_afectada
+        usuario=usuario,
+        accion=str(accion)[:100],
+        modulo=str(modulo)[:50],
+        entidad_afectada=str(entidad_afectada)[:100],
     )
+
+
+class BitacoraMixin:
+    """
+    Registra automáticamente en la bitácora de auditoría cada alta, cambio y
+    baja hecha a través de la API, con el usuario que la realizó.
+
+    Cada vista define `modulo_bitacora` y, si quiere un texto más claro,
+    sobrescribe `etiqueta_bitacora(obj)`. Si necesita guardar campos extra al
+    crear (p. ej. quién lo registró), sobrescribe `datos_extra_creacion()`.
+    """
+
+    modulo_bitacora = ""
+
+    def etiqueta_bitacora(self, obj):
+        return f"{self.modulo_bitacora} #{obj.pk}"
+
+    def datos_extra_creacion(self):
+        return {}
+
+    def perform_create(self, serializer):
+        obj = serializer.save(**self.datos_extra_creacion())
+        registrar_bitacora(self.request.user, "crear", self.modulo_bitacora, self.etiqueta_bitacora(obj))
+        return obj
+
+    def perform_update(self, serializer):
+        obj = serializer.save()
+        registrar_bitacora(self.request.user, "actualizar", self.modulo_bitacora, self.etiqueta_bitacora(obj))
+        return obj
+
+    def perform_destroy(self, instance):
+        etiqueta = self.etiqueta_bitacora(instance)
+        instance.delete()
+        registrar_bitacora(self.request.user, "eliminar", self.modulo_bitacora, etiqueta)
 
 
 def _es_admin_o_supervisor(request):
-    user = request.user
-    return bool(
-        user.is_authenticated and user.rol and user.rol.nombre in ("Administrador", "Supervisor")
+    return nombre_rol(request.user) in ("Administrador", "Supervisor")
+
+
+def _validar_password(password, user=None):
+    """Valida con los validadores de Django y regresa la lista de mensajes de error."""
+    try:
+        validate_password(password, user=user)
+    except DjangoValidationError as e:
+        return list(e.messages)
+    return []
+
+
+def _invalidar_refresh_jti(jti):
+    """
+    Mete a la lista negra el refresh token con ese jti, aunque no exista aún
+    en OutstandingToken (SimpleJWT no registra los tokens que nacen de una
+    rotación, así que hay que crearlo antes de poder invalidarlo).
+    """
+    outstanding, _ = OutstandingToken.objects.get_or_create(
+        jti=jti,
+        defaults={
+            "token": "",
+            "expires_at": timezone.now() + jwt_settings.REFRESH_TOKEN_LIFETIME,
+        },
     )
+    BlacklistedToken.objects.get_or_create(token=outstanding)
+
+
+def _cerrar_sesiones_de(usuario):
+    """Invalida todos los refresh tokens del usuario y borra sus sesiones activas."""
+    sesiones = SesionActiva.objects.filter(usuario=usuario)
+    for jti in list(sesiones.values_list("refresh_jti", flat=True)):
+        _invalidar_refresh_jti(jti)
+    sesiones.delete()
+
+
+def _generar_password_temporal(usuario):
+    """Contraseña aleatoria que además cumple los validadores de Django."""
+    for _ in range(10):
+        candidata = secrets.token_urlsafe(9)
+        if not _validar_password(candidata, user=usuario):
+            return candidata
+    raise ValidationError("No se pudo generar una contraseña temporal segura. Intenta de nuevo.")
 
 
 class RolViewSet(viewsets.ModelViewSet):
@@ -108,10 +201,21 @@ class RolViewSet(viewsets.ModelViewSet):
     permission_classes = [EsAdministrador]
 
 
-class UsuarioViewSet(viewsets.ModelViewSet):
+class UsuarioViewSet(BitacoraMixin, viewsets.ModelViewSet):
+    """
+    Administrador/Supervisor administran cuentas; cualquier usuario puede ver
+    y editar SU PROPIO registro (datos de contacto, foto, preferencias), pero
+    las reglas de privilegio (rol, estado, usuario, contraseña ajena) se
+    validan en UsuarioSerializer.validate.
+    """
+
     queryset = Usuario.objects.select_related("rol").all()
     serializer_class = UsuarioSerializer
     permission_classes = [EsAdminOSupervisor]
+    modulo_bitacora = "Usuarios"
+
+    def etiqueta_bitacora(self, obj):
+        return f"Usuario {obj.username}"
 
     def get_queryset(self):
         # Cada quien puede ver/editar su propio usuario aunque no sea Admin/Supervisor
@@ -120,9 +224,29 @@ class UsuarioViewSet(viewsets.ModelViewSet):
         return super().get_queryset()
 
     def get_permissions(self):
-        if self.action in ("retrieve", "update", "partial_update", "cambiar_password"):
+        if self.action in ("retrieve", "update", "partial_update", "cambiar_password", "restablecer_password"):
             return [permissions.IsAuthenticated()]
+        if self.action == "destroy":
+            return [EsAdministrador()]
         return super().get_permissions()
+
+    def perform_update(self, serializer):
+        cambio_password = "password" in serializer.validated_data
+        obj = serializer.save()
+        # Los cambios de uno mismo (foto, teléfono, preferencias) son muy
+        # frecuentes y no aportan a la auditoría; se registran los hechos
+        # sobre cuentas de otras personas.
+        if obj.pk != self.request.user.pk:
+            registrar_bitacora(self.request.user, "actualizar", self.modulo_bitacora, self.etiqueta_bitacora(obj))
+            if cambio_password:
+                # Si le cambian la contraseña a alguien, sus sesiones abiertas dejan de servir.
+                _cerrar_sesiones_de(obj)
+        return obj
+
+    def perform_destroy(self, instance):
+        if instance.pk == self.request.user.pk:
+            raise PermissionDenied("No puedes eliminar tu propia cuenta.")
+        super().perform_destroy(instance)
 
     @action(detail=False, methods=["post"])
     def cambiar_password(self, request):
@@ -135,50 +259,115 @@ class UsuarioViewSet(viewsets.ModelViewSet):
         """
         actual = request.data.get("actual", "")
         nueva = request.data.get("nueva", "")
-        if not nueva or len(nueva) < 6:
-            return Response({"detail": "La nueva contraseña debe tener al menos 6 caracteres."}, status=400)
         if not request.user.check_password(actual):
             return Response({"detail": "La contraseña actual no es correcta."}, status=400)
+        errores = _validar_password(nueva, user=request.user)
+        if errores:
+            return Response({"detail": " ".join(errores)}, status=400)
         request.user.set_password(nueva)
         request.user.save()
+        registrar_bitacora(request.user, "cambiar_password", "Configuración", "Cambió su contraseña")
         return Response({"detail": "Contraseña actualizada."})
 
 
-class ConductorViewSet(viewsets.ModelViewSet):
-    queryset = Conductor.objects.select_related("usuario").all()
+    @action(detail=True, methods=["post"])
+    def restablecer_password(self, request, pk=None):
+        """
+        POST /api/usuarios/{id}/restablecer_password/
+        Para cuando alguien olvidó su contraseña. Genera una contraseña
+        temporal aleatoria, la guarda cifrada, cierra las sesiones abiertas de
+        esa cuenta y la devuelve UNA sola vez en la respuesta para que quien
+        la restableció se la entregue a la persona. Queda en la bitácora.
+
+        Quién puede a quién: ver permissions.puede_restablecer_password.
+        """
+        if nombre_rol(request.user) not in ("Administrador", "Supervisor", "RH"):
+            raise PermissionDenied("No tienes permiso para restablecer contraseñas.")
+        objetivo = self.get_object()
+        if objetivo.pk == request.user.pk:
+            raise PermissionDenied("Para cambiar tu contraseña usa la opción «Cambiar contraseña».")
+        if not puede_restablecer_password(request.user, objetivo):
+            raise PermissionDenied("No tienes permiso para restablecer la contraseña de esa cuenta.")
+        if not (objetivo.is_active and objetivo.activo):
+            return Response(
+                {"detail": "La cuenta está dada de baja; reactívala antes de restablecer su contraseña."},
+                status=400,
+            )
+
+        temporal = _generar_password_temporal(objetivo)
+        objetivo.set_password(temporal)
+        objetivo.save()
+        _cerrar_sesiones_de(objetivo)
+        registrar_bitacora(
+            request.user, "restablecer_password", self.modulo_bitacora, self.etiqueta_bitacora(objetivo)
+        )
+        return Response(
+            {
+                "detail": "Contraseña restablecida. Entrégala a la persona; no se volverá a mostrar.",
+                "usuario_username": objetivo.username,
+                "password_temporal": temporal,
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+
+class ConductorViewSet(BitacoraMixin, viewsets.ModelViewSet):
+    queryset = Conductor.objects.select_related("usuario", "unidad_asignada").all()
     serializer_class = ConductorSerializer
     permission_classes = [EsPersonalOperativo | EsRH]
+    modulo_bitacora = "Conductores"
+
+    def etiqueta_bitacora(self, obj):
+        return f"Conductor {obj.clave}"
 
 
-class UnidadViewSet(viewsets.ModelViewSet):
+class UnidadViewSet(BitacoraMixin, viewsets.ModelViewSet):
     queryset = Unidad.objects.all()
     serializer_class = UnidadSerializer
     permission_classes = [EsPersonalOperativo]
+    modulo_bitacora = "Unidades"
+
+    def etiqueta_bitacora(self, obj):
+        return f"Unidad {obj.eco}"
 
 
-class RutaViewSet(viewsets.ModelViewSet):
+class RutaViewSet(BitacoraMixin, viewsets.ModelViewSet):
+    """Catálogo de rutas. El Conductor solo puede consultarlo (lo necesita su pantalla de Aforo)."""
+
     queryset = Ruta.objects.all()
     serializer_class = RutaSerializer
-    permission_classes = [EsPersonalOperativo]
+    permission_classes = [EsPersonalOperativo | EsConductorSoloLectura]
+    modulo_bitacora = "Rutas"
+
+    def etiqueta_bitacora(self, obj):
+        return f"Ruta {obj.nombre}"
 
 
-class TurnoViewSet(viewsets.ModelViewSet):
+class TurnoViewSet(BitacoraMixin, viewsets.ModelViewSet):
+    """Catálogo de turnos. El Conductor solo puede consultarlo (lo necesita su pantalla de Aforo)."""
+
     queryset = Turno.objects.all()
     serializer_class = TurnoSerializer
-    permission_classes = [EsPersonalOperativo]
+    permission_classes = [EsPersonalOperativo | EsConductorSoloLectura]
+    modulo_bitacora = "Turnos"
+
+    def etiqueta_bitacora(self, obj):
+        return f"Turno {obj.nombre}"
 
 
-class ServicioViewSet(viewsets.ModelViewSet):
+class ServicioViewSet(BitacoraMixin, viewsets.ModelViewSet):
     queryset = Servicio.objects.select_related("conductor", "unidad", "ruta", "turno").all()
     serializer_class = ServicioSerializer
     permission_classes = [EsPersonalOperativo]
+    modulo_bitacora = "Servicios"
 
 
-class AforoViewSet(viewsets.ModelViewSet):
+class AforoViewSet(BitacoraMixin, viewsets.ModelViewSet):
     """Personal operativo ve todo; un Conductor solo ve/crea lo suyo."""
 
     serializer_class = AforoSerializer
     permission_classes = [EsPersonalOperativo | EsConductor]
+    modulo_bitacora = "Aforo"
 
     def get_serializer_context(self):
         # Necesario para que foto_url arme una URL absoluta.
@@ -187,76 +376,72 @@ class AforoViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         qs = Aforo.objects.select_related("ruta", "turno", "registrado_por").all()
         user = self.request.user
-        if user.rol and user.rol.nombre in ("Administrador", "Supervisor", "Monitoreo"):
+        if nombre_rol(user) in ("Administrador", "Supervisor", "Monitoreo"):
             return qs
         return qs.filter(registrado_por=user)
 
-    def perform_create(self, serializer):
-        aforo = serializer.save(registrado_por=self.request.user)
-        registrar_bitacora(self.request.user, "crear", "Aforo", f"Aforo #{aforo.id}")
+    def datos_extra_creacion(self):
+        return {"registrado_por": self.request.user}
+
+    def etiqueta_bitacora(self, obj):
+        return f"Aforo #{obj.pk}"
 
 
-class MantenimientoViewSet(viewsets.ModelViewSet):
+class MantenimientoViewSet(BitacoraMixin, viewsets.ModelViewSet):
     queryset = Mantenimiento.objects.select_related("unidad").all()
     serializer_class = MantenimientoSerializer
     permission_classes = [EsPersonalOperativo]
+    modulo_bitacora = "Mantenimiento"
+
+    def etiqueta_bitacora(self, obj):
+        return f"Mantenimiento {obj.categoria} de la unidad {obj.unidad.eco}"
 
 
-class IncidenciaViewSet(viewsets.ModelViewSet):
+class IncidenciaViewSet(BitacoraMixin, viewsets.ModelViewSet):
     """
     Admin/Supervisor/Monitoreo ven y registran todas las incidencias.
-    Un Conductor solo ve las suyas (no puede crear/editar).
+    Un Conductor solo puede CONSULTAR las suyas: no puede crear, editar ni
+    borrar (así nadie puede inventar ni ocultar incidencias).
     """
 
     serializer_class = IncidenciaSerializer
-    permission_classes = [EsPersonalOperativo | EsConductor]
+    permission_classes = [EsPersonalOperativo | EsConductorSoloLectura]
+    modulo_bitacora = "Incidencias"
 
     def get_queryset(self):
         qs = Incidencia.objects.select_related("conductor__usuario", "unidad").all()
         user = self.request.user
-        if user.rol and user.rol.nombre in ("Administrador", "Supervisor", "Monitoreo"):
+        if nombre_rol(user) in ("Administrador", "Supervisor", "Monitoreo"):
             return qs
         return qs.filter(conductor__usuario=user)
 
-    def perform_create(self, serializer):
-        incidencia = serializer.save()
-        registrar_bitacora(
-            self.request.user, "crear", "Incidencias",
-            f"Incidencia #{incidencia.id} ({incidencia.tipo}) de {incidencia.conductor}",
-        )
+    def etiqueta_bitacora(self, obj):
+        return f"Incidencia #{obj.pk} ({obj.tipo}) de {obj.conductor}"
 
 
-class ReporteConductorViewSet(viewsets.ModelViewSet):
+class ReporteConductorViewSet(BitacoraMixin, viewsets.ModelViewSet):
     """Concentrado digital del formato "Reporte de Conductor" (FOPR-MAN-01-02)."""
 
     queryset = ReporteConductor.objects.select_related("unidad").all()
     serializer_class = ReporteConductorSerializer
     permission_classes = [EsPersonalOperativo]
+    modulo_bitacora = "Reportes"
 
-    def perform_create(self, serializer):
-        reporte = serializer.save()
-        registrar_bitacora(
-            self.request.user, "crear", "Reportes",
-            f"Reporte del Conductor de {reporte.conductor} (unidad {reporte.unidad.eco})",
-        )
-
-    def perform_destroy(self, instance):
-        registrar_bitacora(
-            self.request.user, "eliminar", "Reportes",
-            f"Reporte del Conductor de {instance.conductor} (unidad {instance.unidad.eco})",
-        )
-        instance.delete()
+    def etiqueta_bitacora(self, obj):
+        return f"Reporte del Conductor de {obj.conductor} (unidad {obj.unidad.eco})"
 
 
-class PermisoViewSet(viewsets.ModelViewSet):
+class PermisoViewSet(BitacoraMixin, viewsets.ModelViewSet):
     """
     Administrador/Supervisor y RH ven y autorizan/rechazan todo.
     Un Conductor solo ve/crea sus propias solicitudes (personal u oficio de
-    comisión), con rango de fechas, motivo y un documento de soporte opcional.
+    comisión), con rango de fechas, motivo y un documento de soporte opcional,
+    y solo puede modificarlas o cancelarlas mientras sigan PENDIENTES.
     """
 
     serializer_class = PermisoSerializer
     permission_classes = [EsAdminOSupervisor | EsRH | EsConductor]
+    modulo_bitacora = "Permisos"
 
     def get_serializer_context(self):
         # Necesario para que documento_url arme una URL absoluta.
@@ -265,18 +450,45 @@ class PermisoViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         qs = Permiso.objects.select_related("conductor__usuario", "autorizado_por").all()
         user = self.request.user
-        if user.rol and user.rol.nombre in ("Administrador", "Supervisor", "RH"):
+        if nombre_rol(user) in ("Administrador", "Supervisor", "RH"):
             return qs
         # Conductor: solo lo suyo
         return qs.filter(conductor__usuario=user)
 
+    def _es_gestor(self):
+        return nombre_rol(self.request.user) in ("Administrador", "Supervisor", "RH")
+
+    def _exigir_pendiente_si_conductor(self, permiso):
+        if not self._es_gestor() and permiso.estado != Permiso.Estado.PENDIENTE:
+            raise PermissionDenied("Solo puedes modificar o cancelar solicitudes que sigan pendientes.")
+
+    def etiqueta_bitacora(self, obj):
+        return f"Permiso #{obj.pk}"
+
     def perform_create(self, serializer):
         conductor = getattr(self.request.user, "conductor", None)
-        if conductor is not None:
+        if conductor is not None and not self._es_gestor():
+            # Un Conductor siempre crea la solicitud a su propio nombre.
             permiso = serializer.save(conductor=conductor)
         else:
+            if "conductor" not in serializer.validated_data:
+                raise ValidationError({"conductor": "Indica el conductor de la solicitud."})
             permiso = serializer.save()
-        registrar_bitacora(self.request.user, "crear", "Permisos", f"Permiso #{permiso.id}")
+        registrar_bitacora(self.request.user, "crear", "Permisos", self.etiqueta_bitacora(permiso))
+
+    def perform_update(self, serializer):
+        permiso = serializer.instance
+        self._exigir_pendiente_si_conductor(permiso)
+        if self._es_gestor():
+            serializer.save()
+        else:
+            # El Conductor no puede reasignar la solicitud a otra persona.
+            serializer.save(conductor=permiso.conductor)
+        registrar_bitacora(self.request.user, "actualizar", "Permisos", self.etiqueta_bitacora(permiso))
+
+    def perform_destroy(self, instance):
+        self._exigir_pendiente_si_conductor(instance)
+        super().perform_destroy(instance)
 
     @action(detail=True, methods=["post"], permission_classes=[EsAdminOSupervisor | EsRH])
     def autorizar(self, request, pk=None):
@@ -313,7 +525,7 @@ class BitacoraAuditoriaViewSet(viewsets.ReadOnlyModelViewSet):
     def get_queryset(self):
         qs = BitacoraAuditoria.objects.select_related("usuario", "usuario__rol").all()
         user = self.request.user
-        if user.rol and user.rol.nombre in ("Administrador", "Supervisor"):
+        if nombre_rol(user) in ("Administrador", "Supervisor"):
             return qs
         return qs.filter(usuario=user)
 
@@ -349,7 +561,7 @@ class MeView(APIView):
 
 
 def _generar_codigo_supervisor():
-    sufijo = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    sufijo = "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(6))
     return f"SVT-SUP-{sufijo}"
 
 
@@ -359,12 +571,12 @@ class ConfiguracionSistemaView(APIView):
     POST /api/configuracion/codigo-supervisor/  -> genera uno nuevo y lo guarda
     (el anterior deja de funcionar de inmediato).
 
-    Solo Administrador/Supervisor pueden verlo o regenerarlo: es el código que
-    se comparte con quien deba registrarse como Supervisor o Monitoreo desde
-    la pantalla pública de Registro.
+    Solo el Administrador puede verlo o regenerarlo (el Supervisor no, según
+    la tabla RBAC): es el código que se comparte con quien deba registrarse
+    como Supervisor o Monitoreo desde la pantalla pública de Registro.
     """
 
-    permission_classes = [EsAdminOSupervisor]
+    permission_classes = [EsAdministrador]
 
     def get(self, request):
         config = ConfiguracionSistema.obtener()
@@ -393,9 +605,14 @@ class RegistroView(APIView):
     completa después un Administrador o RH desde la pantalla de Conductores.
     Hasta entonces, ese usuario no puede usar Aforo/Permisos porque esas
     pantallas dependen de que exista su registro de Conductor.
+
+    Tiene límite de intentos por IP (scope "registro") para frenar el
+    adivinar el código de autorización por fuerza bruta.
     """
 
     permission_classes = [permissions.AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "registro"
 
     ROLES_VALIDOS = ("Conductor", "Monitoreo", "Supervisor")
     ROLES_CON_CODIGO = ("Monitoreo", "Supervisor")
@@ -418,14 +635,12 @@ class RegistroView(APIView):
             return Response({"detail": "Ya existe una cuenta con ese correo."}, status=400)
         if len(telefono) != 10 or not telefono.isdigit():
             return Response({"detail": "El teléfono debe tener 10 dígitos."}, status=400)
-        if len(password) < 8:
-            return Response({"detail": "La contraseña debe tener al menos 8 caracteres."}, status=400)
         if rol_nombre not in self.ROLES_VALIDOS:
             return Response({"detail": "Rol no válido."}, status=400)
 
         if rol_nombre in self.ROLES_CON_CODIGO:
             config = ConfiguracionSistema.obtener()
-            if not codigo or codigo != config.codigo_supervisor:
+            if not codigo or not secrets.compare_digest(codigo, config.codigo_supervisor):
                 return Response(
                     {"detail": f"El código de autorización de {rol_nombre} no es válido."},
                     status=400,
@@ -448,6 +663,11 @@ class RegistroView(APIView):
             telefono=telefono,
             rol=rol,
         )
+
+        errores = _validar_password(password, user=usuario)
+        if errores:
+            return Response({"detail": " ".join(errores)}, status=400)
+
         usuario.set_password(password)
         usuario.save()
 
@@ -463,26 +683,66 @@ class MiTokenObtainPairView(TokenObtainPairView):
     Sustituye a TokenObtainPairView en config/urls.py: hace exactamente lo
     mismo (POST /api/token/ -> access + refresh) pero además guarda una
     SesionActiva con el dispositivo (User-Agent) e IP de quien inició
-    sesión, para que "Sesión y seguridad" en Configuración pueda mostrar
-    sesiones reales en vez del ejemplo fijo que tenía antes.
+    sesión, y deja constancia en la bitácora de auditoría. Tiene límite de
+    intentos por IP (scope "login") contra fuerza bruta de contraseñas.
     """
+
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "login"
 
     def post(self, request, *args, **kwargs):
         response = super().post(request, *args, **kwargs)
         refresh = response.data.get("refresh") if response.status_code == 200 else None
         if refresh:
             try:
-                from rest_framework_simplejwt.tokens import RefreshToken
-
                 token = RefreshToken(refresh)
+                usuario = Usuario.objects.get(pk=token["user_id"])
                 SesionActiva.objects.create(
-                    usuario_id=token["user_id"],
+                    usuario=usuario,
                     refresh_jti=token["jti"],
                     dispositivo=_describir_dispositivo(request.META.get("HTTP_USER_AGENT", "")),
                     ip=request.META.get("REMOTE_ADDR"),
                 )
+                registrar_bitacora(usuario, "iniciar_sesion", "Sesión", "Inició sesión")
             except Exception:
                 # No queremos que un problema al registrar la sesión tumbe el login.
+                pass
+        return response
+
+
+class MiTokenRefreshView(TokenRefreshView):
+    """
+    Sustituye a TokenRefreshView. Como los refresh tokens ROTAN (cada
+    renovación emite uno nuevo con otro jti), hay que mantener la SesionActiva
+    apuntando al jti VIGENTE; si no, "Cerrar sesión" invalidaría un token
+    viejo y el nuevo seguiría funcionando.
+    """
+
+    def post(self, request, *args, **kwargs):
+        jti_anterior = None
+        try:
+            jti_anterior = RefreshToken(request.data.get("refresh", ""))["jti"]
+        except Exception:
+            pass
+
+        response = super().post(request, *args, **kwargs)
+
+        nuevo = response.data.get("refresh") if response.status_code == 200 else None
+        if nuevo and jti_anterior:
+            try:
+                token = RefreshToken(nuevo)
+                # Registrar el token nuevo para que pueda invalidarse después.
+                OutstandingToken.objects.get_or_create(
+                    jti=token["jti"],
+                    defaults={
+                        "user_id": token["user_id"],
+                        "token": nuevo,
+                        "created_at": timezone.now(),
+                        "expires_at": datetime_from_epoch(token["exp"]),
+                    },
+                )
+                SesionActiva.objects.filter(refresh_jti=jti_anterior).update(refresh_jti=token["jti"])
+            except Exception:
                 pass
         return response
 
@@ -503,10 +763,8 @@ class SesionActivaViewSet(viewsets.ReadOnlyModelViewSet):
     @action(detail=False, methods=["post"])
     def cerrar_todas(self, request):
         sesiones = SesionActiva.objects.filter(usuario=request.user)
-        for jti in sesiones.values_list("refresh_jti", flat=True):
-            outstanding = OutstandingToken.objects.filter(jti=jti).first()
-            if outstanding:
-                BlacklistedToken.objects.get_or_create(token=outstanding)
+        for jti in list(sesiones.values_list("refresh_jti", flat=True)):
+            _invalidar_refresh_jti(jti)
         sesiones.delete()
         registrar_bitacora(
             request.user, "cerrar_sesiones", "Configuración", "Cerró sesión en todos los dispositivos"
@@ -522,16 +780,14 @@ class SesionActivaViewSet(viewsets.ReadOnlyModelViewSet):
         alguien más adivinando un id.
         """
         sesion = self.get_object()
-        outstanding = OutstandingToken.objects.filter(jti=sesion.refresh_jti).first()
-        if outstanding:
-            BlacklistedToken.objects.get_or_create(token=outstanding)
+        _invalidar_refresh_jti(sesion.refresh_jti)
         dispositivo = sesion.dispositivo or "sesión"
         sesion.delete()
         registrar_bitacora(request.user, "cerrar_sesion", "Configuración", f"Cerró la sesión: {dispositivo}")
         return Response({"detail": "Sesión cerrada."})
 
 
-class HallazgoAuditoriaViewSet(viewsets.ModelViewSet):
+class HallazgoAuditoriaViewSet(BitacoraMixin, viewsets.ModelViewSet):
     """
     Hallazgos de auditorías internas/externas, con fecha límite y fecha de
     cierre. Alimenta el indicador "Cumplimiento a Auditorías" en la pantalla
@@ -541,17 +797,10 @@ class HallazgoAuditoriaViewSet(viewsets.ModelViewSet):
     queryset = HallazgoAuditoria.objects.select_related("registrado_por").all()
     serializer_class = HallazgoAuditoriaSerializer
     permission_classes = [EsAdminOSupervisor]
+    modulo_bitacora = "Cumplimiento"
 
-    def perform_create(self, serializer):
-        hallazgo = serializer.save(registrado_por=self.request.user)
-        registrar_bitacora(
-            self.request.user, "crear", "Cumplimiento",
-            f"Hallazgo de auditoría: {hallazgo.descripcion[:60]}",
-        )
+    def datos_extra_creacion(self):
+        return {"registrado_por": self.request.user}
 
-    def perform_update(self, serializer):
-        hallazgo = serializer.save()
-        registrar_bitacora(
-            self.request.user, "editar", "Cumplimiento",
-            f"Hallazgo de auditoría #{hallazgo.id}",
-        )
+    def etiqueta_bitacora(self, obj):
+        return f"Hallazgo de auditoría #{obj.pk}: {obj.descripcion[:50]}"

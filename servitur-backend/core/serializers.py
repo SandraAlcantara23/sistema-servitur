@@ -1,10 +1,14 @@
 """
 core/serializers.py
 """
+import secrets
 from datetime import date
 
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.utils.text import slugify
 from rest_framework import serializers
+from rest_framework.exceptions import PermissionDenied
 
 from .models import (
     Rol,
@@ -24,6 +28,22 @@ from .models import (
     SesionActiva,
     HallazgoAuditoria,
 )
+from .permissions import nombre_rol, puede_restablecer_password
+
+
+def _validar_telefono(valor):
+    """El teléfono es opcional, pero si viene debe tener exactamente 10 dígitos."""
+    if valor and not (len(valor) == 10 and valor.isdigit()):
+        raise serializers.ValidationError("El teléfono debe tener 10 dígitos.")
+    return valor
+
+
+def _validar_password_segura(password, user=None):
+    """Aplica los validadores de contraseña de Django (largo, común, numérica...)."""
+    try:
+        validate_password(password, user=user)
+    except DjangoValidationError as e:
+        raise serializers.ValidationError(list(e.messages))
 
 
 class RolSerializer(serializers.ModelSerializer):
@@ -57,6 +77,61 @@ class UsuarioSerializer(serializers.ModelSerializer):
         request = self.context.get("request")
         url = obj.foto.url
         return request.build_absolute_uri(url) if request else url
+
+    def validate_telefono(self, valor):
+        return _validar_telefono(valor)
+
+    def validate_email(self, valor):
+        if not valor:
+            return valor
+        otros = Usuario.objects.filter(email__iexact=valor)
+        if self.instance is not None:
+            otros = otros.exclude(pk=self.instance.pk)
+        if otros.exists():
+            raise serializers.ValidationError("Ya existe una cuenta con ese correo.")
+        return valor
+
+    def validate(self, attrs):
+        """
+        Reglas de privilegio (RBAC en el servidor, no solo en el frontend):
+          - Solo el Administrador puede cambiar el rol de una cuenta.
+          - Ni siquiera con acceso a su propio registro se puede cambiar el
+            rol, el usuario o el estado (activo) de uno mismo, salvo el
+            Administrador.
+          - El Supervisor no puede crear/editar cuentas de Administrador ni
+            crear otras de Supervisor.
+          - La contraseña propia solo se cambia con "cambiar_password"
+            (que exige la contraseña actual); por PATCH solo se puede
+            restablecer la de otra persona (Admin/Supervisor).
+        """
+        request = self.context.get("request")
+        editor = getattr(request, "user", None)
+        es_admin = nombre_rol(editor) == "Administrador"
+        objetivo = self.instance
+        es_propio = bool(objetivo is not None and editor is not None and objetivo.pk == editor.pk)
+
+        if not es_admin:
+            if objetivo is not None:
+                if nombre_rol(objetivo) == "Administrador":
+                    raise PermissionDenied("Solo un Administrador puede modificar una cuenta de Administrador.")
+                if "rol" in attrs and attrs["rol"] != objetivo.rol:
+                    raise PermissionDenied("Solo el Administrador puede cambiar roles.")
+                if es_propio:
+                    for campo in ("username", "activo", "is_active"):
+                        if campo in attrs and attrs[campo] != getattr(objetivo, campo):
+                            raise PermissionDenied("No puedes modificar ese dato de tu propia cuenta.")
+            else:
+                rol_nuevo = attrs.get("rol")
+                if rol_nuevo and rol_nuevo.nombre in ("Administrador", "Supervisor"):
+                    raise PermissionDenied("Solo el Administrador puede crear cuentas de Administrador o Supervisor.")
+
+        if "password" in attrs:
+            if es_propio:
+                raise PermissionDenied("Para cambiar tu contraseña usa la opción «Cambiar contraseña».")
+            if objetivo is not None and not puede_restablecer_password(editor, objetivo):
+                raise PermissionDenied("No tienes permiso para cambiar la contraseña de esa cuenta.")
+            _validar_password_segura(attrs["password"], user=objetivo)
+        return attrs
 
     def create(self, validated_data):
         password = validated_data.pop("password", None)
@@ -107,6 +182,24 @@ class ConductorSerializer(serializers.ModelSerializer):
             "unidad_asignada", "unidad_asignada_eco", "estatus", "password",
         ]
 
+    def validate_telefono(self, valor):
+        return _validar_telefono(valor)
+
+    def validate_usuario(self, usuario):
+        if nombre_rol(usuario) != "Conductor":
+            raise serializers.ValidationError("El usuario indicado no tiene el rol Conductor.")
+        return usuario
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data["usuario_username"] = instance.usuario.username
+        # Solo al dar de alta: la contraseña temporal se muestra UNA vez para
+        # que Administrador/RH se la entreguen al conductor (no se guarda en claro).
+        temporal = getattr(instance, "_password_temporal", None)
+        if temporal:
+            data["password_temporal"] = temporal
+        return data
+
     def get_estatus(self, obj):
         return "Activo" if (obj.usuario.activo and obj.usuario.is_active) else "Baja"
 
@@ -134,9 +227,16 @@ class ConductorSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         nombre = validated_data.pop("nombre", "").strip()
-        password = validated_data.pop("password", "") or "servitur123"
+        password_indicada = validated_data.pop("password", "")
+        if password_indicada:
+            _validar_password_segura(password_indicada)
+        # Si no se indica contraseña se genera una temporal aleatoria (nunca
+        # una contraseña fija conocida por todos).
+        password = password_indicada or secrets.token_urlsafe(9)
+        generada = not password_indicada
+        crear_usuario = "usuario" not in validated_data
 
-        if "usuario" not in validated_data:
+        if crear_usuario:
             partes = nombre.split(" ", 1)
             first_name = partes[0] if partes else ""
             last_name = partes[1] if len(partes) > 1 else ""
@@ -151,7 +251,10 @@ class ConductorSerializer(serializers.ModelSerializer):
             usuario.save()
             validated_data["usuario"] = usuario
 
-        return super().create(validated_data)
+        conductor = super().create(validated_data)
+        if crear_usuario and generada:
+            conductor._password_temporal = password
+        return conductor
 
     def update(self, instance, validated_data):
         nombre = validated_data.pop("nombre", None)

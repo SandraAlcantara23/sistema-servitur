@@ -25,10 +25,10 @@ export const RUTA_INICIO_POR_ROL = {
 
 // Secciones dentro de la pantalla de Configuración.
 export const CONFIG_SECCIONES_POR_ROL = {
-  Administrador: ['datosUsuario', 'contrasena', 'codigoSupervisor', 'notificaciones', 'sesionSeguridad', 'gestionRoles', 'apariencia'],
-  Supervisor: ['datosUsuario', 'contrasena', 'notificaciones', 'sesionSeguridad', 'apariencia'],
+  Administrador: ['datosUsuario', 'contrasena', 'restablecerPasswords', 'codigoSupervisor', 'notificaciones', 'sesionSeguridad', 'gestionRoles', 'apariencia'],
+  Supervisor: ['datosUsuario', 'contrasena', 'restablecerPasswords', 'notificaciones', 'sesionSeguridad', 'apariencia'],
   Monitoreo: ['datosUsuario', 'contrasena', 'notificaciones', 'sesionSeguridad', 'apariencia'],
-  RH: ['datosUsuario', 'contrasena', 'notificaciones', 'sesionSeguridad', 'apariencia'],
+  RH: ['datosUsuario', 'contrasena', 'restablecerPasswords', 'notificaciones', 'sesionSeguridad', 'apariencia'],
   Conductor: ['datosUsuario', 'contrasena', 'notificaciones', 'apariencia'],
 }
 

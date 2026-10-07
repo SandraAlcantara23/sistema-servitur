@@ -1,44 +1,25 @@
-// TODO: esto es una bitácora 100% simulada en localStorage, solo para
-// demostrar el concepto mientras no existe backend. Cuando se conecte
-// Django, cada acción debe registrarse del lado del servidor (nunca solo
-// en el navegador, donde cualquiera podría borrar o falsear el historial).
+// La bitácora de auditoría REAL vive en el servidor (modelo BitacoraAuditoria
+// en Django): el backend registra cada alta, cambio y baja con el usuario que
+// la hizo, y la pantalla "Auditoría" la consulta desde /api/bitacora/.
+//
+// Antes este archivo guardaba una bitácora simulada en localStorage, lo cual
+// no sirve como auditoría (cualquiera podía borrarla o falsearla desde el
+// navegador). Se deja `registrarEvento` como función vacía para no tener que
+// tocar las pantallas que todavía la llaman; ya no guarda nada.
 
-const CLAVE = 'servitur_bitacora'
-const LIMITE_EVENTOS = 500
-
-function obtenerTodos() {
-  try {
-    const guardados = localStorage.getItem(CLAVE)
-    return guardados ? JSON.parse(guardados) : []
-  } catch {
-    return []
-  }
-}
-
-/**
- * Registra un evento en la bitácora.
- * accion sugeridas: 'crear' | 'actualizar' | 'eliminar' | 'aprobar' | 'rechazar' | 'iniciar_sesion' | 'registrar_cuenta'
- */
-export function registrarEvento({ usuario, rol, accion, modulo, detalle }) {
-  const eventos = obtenerTodos()
-  const nuevo = {
-    id: (eventos[0]?.id ?? 0) + 1,
-    fecha: new Date().toISOString(),
-    usuario: usuario || 'Usuario desconocido',
-    rol: rol || '—',
-    accion,
-    modulo,
-    detalle,
-  }
-  const actualizados = [nuevo, ...eventos].slice(0, LIMITE_EVENTOS)
-  localStorage.setItem(CLAVE, JSON.stringify(actualizados))
-  return nuevo
+export function registrarEvento() {
+  return null
 }
 
 export function obtenerBitacora() {
-  return obtenerTodos()
+  return []
 }
 
 export function limpiarBitacora() {
-  localStorage.removeItem(CLAVE)
+  // Limpia lo que haya quedado de la versión anterior (simulada) en este navegador.
+  try {
+    localStorage.removeItem('servitur_bitacora')
+  } catch {
+    // sin acceso a localStorage: no pasa nada
+  }
 }

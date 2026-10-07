@@ -1,0 +1,6 @@
+.env
+media/
+media_test/
+__pycache__/
+*.pyc
+db.sqlite3

@@ -2,6 +2,9 @@ import { useEffect, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { Settings, Lock, User, Palette, ShieldCheck, Copy, RefreshCw, Check, Bell, Monitor, Users } from 'lucide-react'
 import AppLayout from '../components/layout/AppLayout.jsx'
+import RestablecerPasswords from '../components/configuracion/RestablecerPasswords.jsx'
+import Toast from '../components/common/Toast.jsx'
+import { useToast } from '../hooks/useToast.js'
 import { useAuth } from '../context/AuthContext.jsx'
 import { useTheme } from '../context/ThemeContext.jsx'
 import { seccionConfigPermitida, paginaPermitida, EVENTO_REQUIERE_PAGINA } from '../utils/rolesPermisos.js'
@@ -35,6 +38,7 @@ export default function Configuracion() {
   const { sesion, actualizarSesion, cerrarSesion } = useAuth()
   const { tema, setTema } = useTheme()
   const navigate = useNavigate()
+  const { toast, mostrarToast, cerrarToast } = useToast()
   const rolActualUsuario = sesion?.rol
 
   const [codigoSupervisor, setCodigoSupervisor] = useState('')
@@ -330,6 +334,15 @@ export default function Configuracion() {
         </div>
         )}
 
+        {/* Restablecer contraseñas de otras cuentas (Administrador, Supervisor y RH) */}
+        {seccionConfigPermitida(rolActualUsuario, 'restablecerPasswords') && (
+          <RestablecerPasswords
+            rol={rolActualUsuario}
+            usuarioActual={sesion}
+            mostrarToast={mostrarToast}
+          />
+        )}
+
         {/* Código de autorización de Supervisor */}
         {seccionConfigPermitida(rolActualUsuario, 'codigoSupervisor') && (
         <div className="bg-servitur-tarjeta rounded-xl shadow-sm border border-servitur-texto-secundario/10 p-4 md:p-6">
@@ -541,6 +554,8 @@ export default function Configuracion() {
         </div>
         )}
       </div>
+
+      <Toast toast={toast} onClose={cerrarToast} />
     </AppLayout>
   )
 }

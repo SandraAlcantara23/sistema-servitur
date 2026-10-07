@@ -12,7 +12,6 @@ import {
   Wrench,
   Check,
 } from "lucide-react";
-import { unidades } from "../../data/unidadesMock.js";
 import { useAuth } from "../../context/AuthContext.jsx";
 import { paginaPermitida, PAGINAS_POR_ROL } from "../../utils/rolesPermisos.js";
 import { api } from "../../services/api.js";
@@ -103,6 +102,24 @@ export default function Topbar({ onToggleSidebar }) {
   const navigate = useNavigate();
 
   const [notificaciones, setNotificaciones] = useState([]);
+  // Unidades reales (desde la API) para el buscador; solo se piden si el rol
+  // tiene acceso a la página de Unidades.
+  const [unidades, setUnidades] = useState([]);
+  const puedeVerUnidades = paginasDelRol.includes("unidades");
+
+  useEffect(() => {
+    if (!sesion || !puedeVerUnidades) return;
+    let activo = true;
+    api
+      .get("/unidades/")
+      .then((data) => {
+        if (activo && Array.isArray(data)) setUnidades(data);
+      })
+      .catch(() => {});
+    return () => {
+      activo = false;
+    };
+  }, [sesion?.id, puedeVerUnidades]);
   const [leidas, setLeidas] = useState(() => leerLeidas(sesion?.id));
 
   const cargarNotificaciones = () => {
@@ -208,17 +225,20 @@ export default function Topbar({ onToggleSidebar }) {
       ? unidades
           .filter(
             (u) =>
-              u.eco.includes(q) || u.conductorActual.toLowerCase().includes(q),
+              String(u.eco ?? "").toLowerCase().includes(q) ||
+              (u.conductor_actual ?? "").toLowerCase().includes(q),
           )
           .slice(0, 6)
           .map((u) => ({
             tipo: "Unidad",
-            label: `${u.eco} — ${u.conductorActual}`,
+            label: u.conductor_actual
+              ? `${u.eco} — ${u.conductor_actual}`
+              : `${u.eco}`,
             to: `/unidades/${u.eco}`,
           }))
       : [];
     return [...paginas, ...unidadesMatch];
-  }, [busqueda, paginasDelRol]);
+  }, [busqueda, paginasDelRol, unidades]);
 
   const irAResultado = (to) => {
     navigate(to);
